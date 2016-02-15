@@ -1,5 +1,9 @@
-﻿using System;
+﻿#if !UNITY_WEBPLAYER
+// Note: This parital class is not compiled in for WebPlayer builds.
+// The Unity Webplayer is deprecated. If you *must* use it then make sure Tiled2Unity assets are imported via another build target first.
+using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Text;
 using System.Xml;
@@ -18,8 +22,11 @@ namespace Tiled2Unity
         public void MeshImported(string objPath)
         {
             string xmlPath = GetXmlImportAssetPath(objPath);
-            XDocument doc = XDocument.Load(xmlPath);
-            foreach (var xmlPrefab in doc.Root.Elements("Prefab"))
+
+            ImportBehaviour importBehaviour = ImportBehaviour.FindOrCreateImportBehaviour(xmlPath);
+            importBehaviour.IncrementProgressBar(String.Format("Create prefab: {0}", Path.GetFileNameWithoutExtension(GetPrefabAssetPath(objPath, false, null))));
+
+            foreach (var xmlPrefab in importBehaviour.XmlDocument.Root.Elements("Prefab"))
             {
                 CreatePrefab(xmlPrefab, objPath);
             }
@@ -49,8 +56,9 @@ namespace Tiled2Unity
             tempPrefab.transform.localScale = new Vector3(prefabScale, prefabScale, prefabScale);
 
             // Part 4: Save the prefab, keeping references intact.
-            bool isResource = ImportUtils.GetAttributeAsBoolean(xmlPrefab, "resource", false);
-            string prefabPath = GetPrefabAssetPath(prefabName, isResource);
+            string resourcePath = ImportUtils.GetAttributeAsString(xmlPrefab, "resourcePath", "");
+            bool isResource = !String.IsNullOrEmpty(resourcePath) || ImportUtils.GetAttributeAsBoolean(xmlPrefab, "resource", false);
+            string prefabPath = GetPrefabAssetPath(prefabName, isResource, resourcePath);
             UnityEngine.Object finalPrefab = AssetDatabase.LoadAssetAtPath(prefabPath, typeof(GameObject));
 
             if (finalPrefab == null)
@@ -77,12 +85,30 @@ namespace Tiled2Unity
                 GameObject child = null;
                 if (!String.IsNullOrEmpty(copyFrom))
                 {
-                    child = CreateCopyFromMeshObj(copyFrom, objPath);
+                    float opacity = ImportUtils.GetAttributeAsFloat(goXml, "opacity", 1);
+                    child = CreateCopyFromMeshObj(copyFrom, objPath, opacity);
                     if (child == null)
                     {
                         // We're in trouble. Errors should already be in the log.
                         return;
                     }
+
+                    // Apply the sorting to the renderer of the mesh object we just copied into the child
+                    Renderer renderer = child.GetComponent<Renderer>();
+
+                    string sortingLayer = ImportUtils.GetAttributeAsString(goXml, "sortingLayerName", "");
+                    if (!String.IsNullOrEmpty(sortingLayer) && !SortingLayerExposedEditor.GetSortingLayerNames().Contains(sortingLayer))
+                    {
+                        Debug.LogError(string.Format("Sorting Layer \"{0}\" does not exist. Check your Project Settings -> Tags and Layers", sortingLayer));
+                        renderer.sortingLayerName = "Default";
+                    }
+                    else
+                    {
+                        renderer.sortingLayerName = sortingLayer;
+                    }
+
+                    // Set the sorting order
+                    renderer.sortingOrder = ImportUtils.GetAttributeAsInt(goXml, "sortingOrder", 0);
                 }
                 else
                 {
@@ -94,21 +120,13 @@ namespace Tiled2Unity
                     child.name = name;
                 }
 
+                // Assign the child to the parent
+                child.transform.parent = parent.transform;
+
                 // Set the position
                 float x = ImportUtils.GetAttributeAsFloat(goXml, "x", 0);
                 float y = ImportUtils.GetAttributeAsFloat(goXml, "y", 0);
-                child.transform.position = new Vector3(x, y, 0);
-
-                // Set the rotation
-                float r = ImportUtils.GetAttributeAsFloat(goXml, "rotation", 0);
-                if (r != 0)
-                {
-                    // Use negative 'r' because of change in coordinate systems between Tiled and Unity
-                    child.transform.eulerAngles = new Vector3(0, 0, -r);
-                }
-
-                // Assign the child to the parent
-                child.transform.parent = parent.transform;
+                child.transform.localPosition = new Vector3(x, y, 0);
 
                 // Add any tile animators
                 AddTileAnimatorsTo(child, goXml);
@@ -129,6 +147,19 @@ namespace Tiled2Unity
 
                 // Are there any custom properties?
                 HandleCustomProperties(child, goXml, customImporters);
+
+                // Set scale and rotation *after* children are added otherwise Unity will have child+parent transform cancel each other out
+                float sx = ImportUtils.GetAttributeAsFloat(goXml, "scaleX", 1.0f);
+                float sy = ImportUtils.GetAttributeAsFloat(goXml, "scaleY", 1.0f);
+                child.transform.localScale = new Vector3(sx, sy, 1.0f);
+
+                // Set the rotation
+                // Use negative rotation on the z component because of change in coordinate systems between Tiled and Unity
+                Vector3 localRotation = new Vector3();
+                localRotation.x = (ImportUtils.GetAttributeAsBoolean(goXml, "flipY", false) == true) ? 180.0f : 0.0f;
+                localRotation.y = (ImportUtils.GetAttributeAsBoolean(goXml, "flipX", false) == true) ? 180.0f : 0.0f;
+                localRotation.z = -ImportUtils.GetAttributeAsFloat(goXml, "rotation", 0);
+                child.transform.eulerAngles = localRotation;
             }
         }
 
@@ -214,8 +245,9 @@ namespace Tiled2Unity
                 float width = ImportUtils.GetAttributeAsFloat(xmlBoxCollider2D, "width");
                 float height = ImportUtils.GetAttributeAsFloat(xmlBoxCollider2D, "height");
                 collider.size = new Vector2(width, height);
+                collider.offset = new Vector2(width * 0.5f, -height * 0.5f);
 
-                ImportUtils.SetBoxCollider2DOffset(collider, new Vector2(width * 0.5f, -height * 0.5f));
+                ImportUtils.ApplyColliderOffset(xmlBoxCollider2D, collider);
             }
 
             // Circle colliders
@@ -225,8 +257,9 @@ namespace Tiled2Unity
                 collider.isTrigger = isTrigger;
                 float radius = ImportUtils.GetAttributeAsFloat(xmlCircleCollider2D, "radius");
                 collider.radius = radius;
+                collider.offset = new Vector2(radius, -radius);
 
-                ImportUtils.SetCircleCollider2DOffset(collider, new Vector2(radius, -radius));
+                ImportUtils.ApplyColliderOffset(xmlCircleCollider2D, collider);
             }
 
             // Edge colliders
@@ -244,6 +277,8 @@ namespace Tiled2Unity
                              select new Vector2(x, y);
 
                 collider.points = points.ToArray();
+
+                ImportUtils.ApplyColliderOffset(xmlEdgeCollider2D, collider);
             }
 
             // Polygon colliders
@@ -268,10 +303,12 @@ namespace Tiled2Unity
 
                     collider.SetPath(p, points.ToArray());
                 }
+
+                ImportUtils.ApplyColliderOffset(xmlPolygonCollider2D, collider);
             }
         }
 
-        private GameObject CreateCopyFromMeshObj(string copyFromName, string objPath)
+        private GameObject CreateCopyFromMeshObj(string copyFromName, string objPath, float opacity)
         {
             // Find a matching game object within the mesh object and "copy" it
             // (In Unity terms, the Instantiated object is a copy)
@@ -286,6 +323,10 @@ namespace Tiled2Unity
                 if (gameObj == null)
                     continue;
 
+                // Add a component that will control our initial shader properties
+                TiledInitialShaderProperties shaderProps = gameObj.AddComponent<TiledInitialShaderProperties>();
+                shaderProps.InitialOpacity = opacity;
+
                 // Reset the name so it is not decorated by the Instantiate call
                 gameObj.name = obj.name;
                 return gameObj;
@@ -298,17 +339,14 @@ namespace Tiled2Unity
 
         private void AddTileAnimatorsTo(GameObject gameObject, XElement goXml)
         {
-            foreach (var animXml in goXml.Elements("TileAnimator"))
+            // This object will only visible for a given moment of time within an animation
+            var animXml = goXml.Element("TileAnimator");
+            if (animXml != null)
             {
                 TileAnimator tileAnimator = gameObject.AddComponent<TileAnimator>();
-
-                foreach (var frameXml in animXml.Elements("Frame"))
-                {
-                    TileAnimator.Frame frame = new TileAnimator.Frame();
-                    frame.Vertex_z = ImportUtils.GetAttributeAsFloat(frameXml, "vertex_z");
-                    frame.DurationMs = ImportUtils.GetAttributeAsInt(frameXml, "duration");
-                    tileAnimator.frames.Add(frame);
-                }
+                tileAnimator.StartTime = ImportUtils.GetAttributeAsInt(animXml, "startTimeMs") * 0.001f;
+                tileAnimator.Duration = ImportUtils.GetAttributeAsInt(animXml, "durationMs") * 0.001f;
+                tileAnimator.TotalAnimationTime = ImportUtils.GetAttributeAsInt(animXml, "fullTimeMs") * 0.001f;
             }
         }
 
@@ -363,7 +401,7 @@ namespace Tiled2Unity
                              from t in a.GetTypes()
                              where typeof(ICustomTiledImporter).IsAssignableFrom(t)
                              where !t.IsAbstract
-                             where Attribute.GetCustomAttribute(t, typeof(CustomTiledImporterAttribute)) == null
+                             where System.Attribute.GetCustomAttribute(t, typeof(CustomTiledImporterAttribute)) == null
                              select t;
             foreach (var t in errorTypes)
             {
@@ -375,7 +413,7 @@ namespace Tiled2Unity
                         from t in a.GetTypes()
                         where typeof(ICustomTiledImporter).IsAssignableFrom(t)
                         where !t.IsAbstract
-                        from attr in Attribute.GetCustomAttributes(t, typeof(CustomTiledImporterAttribute))
+                        from attr in System.Attribute.GetCustomAttributes(t, typeof(CustomTiledImporterAttribute))
                         let custom = attr as CustomTiledImporterAttribute
                         orderby custom.Order
                         select t;
@@ -386,3 +424,4 @@ namespace Tiled2Unity
 
     } // end class
 } // end namespace
+#endif
